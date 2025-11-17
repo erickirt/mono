@@ -21,6 +21,7 @@ import {ErrorOrigin} from '../../../../zero-protocol/src/error-origin.ts';
 import {ErrorReason} from '../../../../zero-protocol/src/error-reason.ts';
 import type {ErrorBody} from '../../../../zero-protocol/src/error.ts';
 import {ProtocolError} from '../../../../zero-protocol/src/error.ts';
+import type {CustomQueryTransformer} from '../../custom-queries/transform-query.ts';
 import type {
   PokeEndBody,
   PokePartBody,
@@ -101,6 +102,7 @@ describe('view-syncer/service', () => {
     source: Source<Downstream>;
   };
   let setTimeoutFn: Mock<typeof setTimeout>;
+  let customQueryTransformer: CustomQueryTransformer | undefined;
 
   function callNextSetTimeout(delta: number) {
     // Sanity check that the system time is the mocked time.
@@ -137,6 +139,7 @@ describe('view-syncer/service', () => {
       connect,
       connectWithQueueAndSource,
       setTimeoutFn,
+      customQueryTransformer,
     } = await setup(testDBs, 'view_syncer_service_test', permissionsAll));
 
     return async () => {
@@ -938,30 +941,22 @@ describe('view-syncer/service', () => {
       `);
     });
 
-    test('does not re-transform the same custom query if it was already registered and transformed', async () => {
-      let callCount = 0;
-      mockFetchImpl(() => {
-        callCount++;
-        return Promise.resolve(
-          new Response(
-            JSON.stringify([
-              'transformed',
-              [
-                {
-                  ast: ISSUES_QUERY,
-                  id: 'custom-1',
-                  name: 'named-query-1',
-                },
-                {
-                  ast: ISSUES_QUERY,
-                  id: 'custom-2',
-                  name: 'named-query-2',
-                },
-              ],
-            ] satisfies TransformResponseMessage),
-          ),
-        );
-      });
+    test('always transforms custom queries to validate authorization', async () => {
+      // Spy on transformer's transform method instead of mocking fetch
+      using transformSpy = vi
+        .spyOn(customQueryTransformer!, 'transform')
+        .mockResolvedValue([
+          {
+            id: 'custom-1',
+            transformedAst: ISSUES_QUERY,
+            transformationHash: 'hash-1',
+          },
+          {
+            id: 'custom-2',
+            transformedAst: ISSUES_QUERY,
+            transformationHash: 'hash-2',
+          },
+        ]);
 
       const client = connect(SYNC_CONTEXT, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
@@ -971,8 +966,11 @@ describe('view-syncer/service', () => {
       await nextPoke(client);
       stateChanges.push({state: 'version-ready'});
       await nextPoke(client);
-      expect(callCount).toBe(1);
 
+      // First client should have called transform once
+      expect(transformSpy).toHaveBeenCalledTimes(1);
+
+      // Create second client with same queries
       const client2 = connect(
         {
           ...SYNC_CONTEXT,
@@ -1099,7 +1097,10 @@ describe('view-syncer/service', () => {
           ],
         ]
       `);
-      expect(callCount).toBe(1);
+      // Transform is called twice:
+      // 1. First client connection triggers initial transform
+      // 2. Second client connection triggers transform again (separate validation)
+      expect(transformSpy).toHaveBeenCalledTimes(2);
     });
 
     // test cases where custom query transforms fail
@@ -2119,7 +2120,7 @@ describe('view-syncer/service', () => {
       {...SYNC_CONTEXT, schemaVersion: 1},
       [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY}],
       {
-        tables: {foo: {columns: {bar: {type: 'string'}}}},
+        tables: {foo: {columns: {bar: {type: 'string'}}, primaryKey: ['bar']}},
       },
     );
     expect(await nextPoke(client)).toMatchInlineSnapshot(`
